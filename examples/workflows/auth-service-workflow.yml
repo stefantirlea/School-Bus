@@ -1,0 +1,205 @@
+name: Auth Service CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'services/auth-service/**'
+      - '.github/workflows/auth-service.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'services/auth-service/**'
+      - '.github/workflows/auth-service.yml'
+
+env:
+  SERVICE_NAME: auth-service
+  SERVICE_DIR: services/auth-service
+  IMAGE_NAME: auth-service
+  
+jobs:
+  lint-and-test:
+    name: Lint și Teste
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout cod
+        uses: actions/checkout@v3
+        
+      - name: Configurare Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: ${{ env.SERVICE_DIR }}/package-lock.json
+          
+      - name: Instalare dependențe
+        run: |
+          cd ${{ env.SERVICE_DIR }}
+          npm ci
+          
+      - name: Lint
+        run: |
+          cd ${{ env.SERVICE_DIR }}
+          npm run lint
+          
+      - name: Teste unitare
+        run: |
+          cd ${{ env.SERVICE_DIR }}
+          npm run test
+          
+      - name: Generare raport acoperire
+        run: |
+          cd ${{ env.SERVICE_DIR }}
+          npm run test:coverage
+          
+      - name: Încărcare raport acoperire
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: ${{ env.SERVICE_DIR }}/coverage
+          
+  build:
+    name: Build și Push imagine
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    
+    steps:
+      - name: Checkout cod
+        uses: actions/checkout@v3
+        
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        
+      - name: Login în Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: gcr.io
+          username: _json_key
+          password: ${{ secrets.GCP_SA_KEY }}
+          
+      - name: Extragere metadate pentru Docker
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: gcr.io/${{ secrets.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,format=long
+            type=semver,pattern={{version}}
+            
+      - name: Build și push
+        uses: docker/build-push-action@v3
+        with:
+          context: ${{ env.SERVICE_DIR }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          
+      - name: Scanare imagine pentru vulnerabilități
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          
+      - name: Încărcare rezultate Trivy
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+          
+  deploy-dev:
+    name: Deploy în mediul de dezvoltare
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    environment: dev
+    
+    steps:
+      - name: Checkout cod
+        uses: actions/checkout@v3
+        
+      - name: Configurare credențiale GKE
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          
+      - name: Configurare kubectl
+        uses: google-github-actions/get-gke-credentials@v1
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER_NAME }}
+          location: ${{ secrets.GCP_REGION }}
+          
+      - name: Actualizare deployment Kubernetes
+        run: |
+          # Setare variabile
+          IMAGE_TAG=$(echo $GITHUB_SHA | cut -c1-8)
+          DEPLOYMENT_NAME="${{ env.SERVICE_NAME }}"
+          IMAGE="gcr.io/${{ secrets.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}:$IMAGE_TAG"
+          
+          # Actualizare imagine în deployment
+          kubectl set image deployment/$DEPLOYMENT_NAME $DEPLOYMENT_NAME=$IMAGE -n schoolbus-dev
+          
+          # Verificare status rollout
+          kubectl rollout status deployment/$DEPLOYMENT_NAME -n schoolbus-dev
+          
+      - name: Testare serviciu după deployment
+        run: |
+          # Așteptare ca serviciul să fie accesibil
+          kubectl wait --for=condition=available --timeout=300s deployment/${{ env.SERVICE_NAME }} -n schoolbus-dev
+          
+          # Efectuare test de bază pentru a verifica că serviciul răspunde
+          POD_NAME=$(kubectl get pods -n schoolbus-dev -l app=${{ env.SERVICE_NAME }} -o jsonpath="{.items[0].metadata.name}")
+          kubectl exec $POD_NAME -n schoolbus-dev -- curl -s http://localhost:8080/health | grep -q "UP"
+          
+  deploy-prod:
+    name: Deploy în producție
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: prod
+    
+    steps:
+      - name: Checkout cod
+        uses: actions/checkout@v3
+        
+      - name: Configurare credențiale GKE
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          
+      - name: Configurare kubectl
+        uses: google-github-actions/get-gke-credentials@v1
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER_NAME }}
+          location: ${{ secrets.GCP_REGION }}
+          
+      - name: Deployment în producție
+        run: |
+          # Setare variabile
+          IMAGE_TAG=$(echo $GITHUB_SHA | cut -c1-8)
+          DEPLOYMENT_NAME="${{ env.SERVICE_NAME }}"
+          IMAGE="gcr.io/${{ secrets.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}:$IMAGE_TAG"
+          
+          # Actualizare imagine în deployment
+          kubectl set image deployment/$DEPLOYMENT_NAME $DEPLOYMENT_NAME=$IMAGE -n schoolbus
+          
+          # Verificare status rollout
+          kubectl rollout status deployment/$DEPLOYMENT_NAME -n schoolbus
+          
+      - name: Notificare deployment
+        if: success()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CHANNEL: deployments
+          SLACK_COLOR: good
+          SLACK_ICON: https://github.com/rtCamp.png?size=48
+          SLACK_MESSAGE: 'Auth Service a fost deploiat cu succes în producție :rocket:'
+          SLACK_TITLE: Deployment Succes
+          SLACK_USERNAME: github-actions
