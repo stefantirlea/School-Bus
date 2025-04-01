@@ -1,0 +1,280 @@
+name: Parent Mobile App CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'apps/parent-mobile/**'
+      - '.github/workflows/parent-mobile.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'apps/parent-mobile/**'
+      - '.github/workflows/parent-mobile.yml'
+
+env:
+  APP_NAME: parent-mobile
+  APP_DIR: apps/parent-mobile
+  
+jobs:
+  lint-and-test:
+    name: Lint și Teste React Native
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout cod
+        uses: actions/checkout@v3
+        
+      - name: Configurare Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: ${{ env.APP_DIR }}/package-lock.json
+          
+      - name: Instalare dependențe
+        run: |
+          cd ${{ env.APP_DIR }}
+          npm ci
+          
+      - name: Lint
+        run: |
+          cd ${{ env.APP_DIR }}
+          npm run lint
+          
+      - name: Teste unitare
+        run: |
+          cd ${{ env.APP_DIR }}
+          npm run test
+          
+      - name: Teste cu Jest
+        run: |
+          cd ${{ env.APP_DIR }}
+          npm run test:jest
+          
+  android-build:
+    name: Build Android
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    
+    steps:
+      - name: Checkout cod
+        uses: actions/checkout@v3
+        
+      - name: Configurare JDK 11
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: '11'
+          
+      - name: Configurare Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: ${{ env.APP_DIR }}/package-lock.json
+          
+      - name: Instalare dependențe
+        run: |
+          cd ${{ env.APP_DIR }}
+          npm ci
+          
+      - name: Cache Gradle
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+            
+      - name: Configurare keystore și variabile de mediu
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          cd ${{ env.APP_DIR }}/android
+          
+          # Decodificare keystore
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > app/schoolbus.keystore
+          
+          # Creare fișier keystore.properties
+          echo "storeFile=schoolbus.keystore" > keystore.properties
+          echo "storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" >> keystore.properties
+          echo "keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}" >> keystore.properties
+          echo "keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}" >> keystore.properties
+          
+      - name: Build Android Release
+        run: |
+          cd ${{ env.APP_DIR }}/android
+          ./gradlew bundleRelease
+          
+      - name: Upload Android Bundle
+        uses: actions/upload-artifact@v3
+        with:
+          name: android-release-bundle
+          path: ${{ env.APP_DIR }}/android/app/build/outputs/bundle/release/app-release.aab
+          
+      - name: Build APK pentru testare
+        run: |
+          cd ${{ env.APP_DIR }}/android
+          ./gradlew assembleRelease
+          
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v3
+        with:
+          name: android-release-apk
+          path: ${{ env.APP_DIR }}/android/app/build/outputs/apk/release/app-release.apk
+          
+  ios-build:
+    name: Build iOS
+    needs: lint-and-test
+    runs-on: macos-latest
+    if: github.event_name == 'push'
+    
+    steps:
+      - name: Checkout cod
+        uses: actions/checkout@v3
+        
+      - name: Configurare Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: ${{ env.APP_DIR }}/package-lock.json
+          
+      - name: Instalare dependențe
+        run: |
+          cd ${{ env.APP_DIR }}
+          npm ci
+          
+      - name: Install iOS dependencies
+        run: |
+          cd ${{ env.APP_DIR }}/ios
+          pod install
+          
+      - name: Build iOS
+        env:
+          DEVELOPER_APP_ID: ${{ secrets.APPLE_DEVELOPER_APP_ID }}
+          PROVISIONING_PROFILE_ID: ${{ secrets.APPLE_PROVISIONING_PROFILE_ID }}
+          CODE_SIGNING_IDENTITY: ${{ secrets.APPLE_CODE_SIGNING_IDENTITY }}
+        run: |
+          cd ${{ env.APP_DIR }}/ios
+          
+          # Setup provisioning profile
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "${{ secrets.APPLE_MOBILE_PROVISION_PROFILE_BASE64 }}" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/${{ secrets.APPLE_PROVISIONING_PROFILE_ID }}.mobileprovision
+          
+          # Build iOS app
+          xcodebuild -workspace SchoolBusParent.xcworkspace -scheme SchoolBusParent -configuration Release archive -archivePath build/SchoolBusParent.xcarchive -allowProvisioningUpdates CODE_SIGN_IDENTITY="${{ secrets.APPLE_CODE_SIGNING_IDENTITY }}" PROVISIONING_PROFILE="${{ secrets.APPLE_PROVISIONING_PROFILE_ID }}"
+          
+          # Create IPA
+          xcodebuild -exportArchive -archivePath build/SchoolBusParent.xcarchive -exportOptionsPlist ExportOptions.plist -exportPath build/
+          
+      - name: Upload iOS IPA
+        uses: actions/upload-artifact@v3
+        with:
+          name: ios-app
+          path: ${{ env.APP_DIR }}/ios/build/SchoolBusParent.ipa
+          
+  deploy-to-firebase:
+    name: Deploy aplicație la Firebase App Distribution
+    needs: [android-build, ios-build]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    
+    steps:
+      - name: Checkout cod
+        uses: actions/checkout@v3
+        
+      - name: Download Android APK
+        uses: actions/download-artifact@v3
+        with:
+          name: android-release-apk
+          path: artifacts/android
+          
+      - name: Download iOS IPA
+        uses: actions/download-artifact@v3
+        with:
+          name: ios-app
+          path: artifacts/ios
+          
+      - name: Distribuție aplicații în Firebase
+        uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ secrets.FIREBASE_ANDROID_APP_ID }}
+          token: ${{ secrets.FIREBASE_TOKEN }}
+          groups: testers, internal
+          file: artifacts/android/app-release.apk
+          releaseNotes: |
+            Versiune de testare pentru SchoolBus Parent App
+            Build: ${{ github.run_number }}
+            Commit: ${{ github.sha }}
+            
+      - name: Distribuție iOS în Firebase
+        uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ secrets.FIREBASE_IOS_APP_ID }}
+          token: ${{ secrets.FIREBASE_TOKEN }}
+          groups: testers, internal
+          file: artifacts/ios/SchoolBusParent.ipa
+          releaseNotes: |
+            Versiune de testare pentru SchoolBus Parent App (iOS)
+            Build: ${{ github.run_number }}
+            Commit: ${{ github.sha }}
+            
+  deploy-to-stores:
+    name: Deploy în magazinele de aplicații
+    needs: [android-build, ios-build]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: prod
+    
+    steps:
+      - name: Checkout cod
+        uses: actions/checkout@v3
+        
+      - name: Download Android Bundle
+        uses: actions/download-artifact@v3
+        with:
+          name: android-release-bundle
+          path: artifacts/android
+          
+      - name: Download iOS IPA
+        uses: actions/download-artifact@v3
+        with:
+          name: ios-app
+          path: artifacts/ios
+          
+      - name: Configurare credențiale pentru Google Play
+        run: echo '${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}' > google-play-key.json
+          
+      - name: Deployment în Google Play
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJson: google-play-key.json
+          packageName: ro.scopesystems.schoolbus.parent
+          releaseFiles: artifacts/android/app-release.aab
+          track: internal
+          status: completed
+          inAppUpdatePriority: 3
+          
+      - name: Deployment în App Store Connect
+        uses: apple-actions/upload-app-store@v1
+        with:
+          app-path: artifacts/ios/SchoolBusParent.ipa
+          apple-id: ${{ secrets.APPLE_ID }}
+          password: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          
+      - name: Notificare deployment
+        if: success()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CHANNEL: releases
+          SLACK_COLOR: good
+          SLACK_ICON: https://github.com/rtCamp.png?size=48
+          SLACK_MESSAGE: 'Aplicația Parent a fost trimisă în magazinele de aplicații 📱'
+          SLACK_TITLE: App Store Release
+          SLACK_USERNAME: github-actions
